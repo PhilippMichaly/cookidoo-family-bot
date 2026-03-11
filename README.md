@@ -10,6 +10,9 @@ Ein Telegram-Bot für Familien mit Thermomix: Jeden Tag schlägt der Bot Rezepte
 - **Automatische Einkaufsliste** – wird direkt in Cookidoo eingetragen
 - **Schwierigkeitsfilter** – keine "schweren" Rezepte (konfigurierbar)
 - **Süßspeisen-Filter** – filtert Desserts heraus (mit Ausnahme-Whitelist)
+- **Rezept-Historie** – Gewinner der letzten 14 Tage werden nicht erneut vorgeschlagen
+- **Stichentscheid** – bei Gleichstand wird zufällig gelost und transparent angezeigt
+- **Abstimmungszeit verlängern** – „Liste bis 17:00 laufen lassen“ direkt im Chat
 - **Feature-Requests per Chat** – `/wunsch`, `/feature` oder `/idee` im Gruppenchat
 
 ## Voraussetzungen
@@ -106,7 +109,9 @@ Siehe das [Self-Hosting Konzept](docs/) für eine vollständige Anleitung mit Po
 | `tally_votes.py` | Phase 2: Stimmen auswerten, Gewinner verkünden, Einkaufsliste |
 | `cookidoo_client.py` | Cookidoo-API-Wrapper – Rezepte laden, filtern, Einkaufsliste |
 | `telegram_client.py` | Telegram Bot API – Nachrichten, Inline-Buttons, Voting |
+| `voting.py` | Gewinner-Ermittlung mit Stichentscheid (Tie-Breaking) |
 | `feature_listener.py` | Prüft auf `/wunsch`-Kommandos im Chat |
+| `feature_requests.py` | Parst Sonderbefehle (z.B. Abstimmungszeit verlängern) |
 | `config.py` | Konfiguration aus Umgebungsvariablen / `.env` |
 | `setup_chat_id.py` | Hilfsskript zum Ermitteln der Telegram-Chat-ID |
 | `.env.example` | Vorlage für die Konfigurationsdatei |
@@ -126,7 +131,9 @@ Alle Einstellungen erfolgen über Umgebungsvariablen oder die `.env`-Datei:
 | `COOKIDOO_URL` | | Cookidoo-URL | `https://cookidoo.de/foundation/de-DE` |
 | `NUM_RECIPE_CANDIDATES` | | Anzahl Vorschläge | `7` |
 | `VOTING_DURATION_MINUTES` | | Abstimmungsdauer (Minuten) | `120` |
+| `VOTING_DURATION_MAX_MINUTES` | | Max. Verlängerung per Chat (Minuten) | `720` |
 | `MAX_DIFFICULTY` | | Max. Schwierigkeit (`easy`/`medium`/`difficult`) | `medium` |
+| `RECIPE_HISTORY_DAYS` | | Tage, in denen Gewinner nicht wiederholt werden | `14` |
 
 ## Süßspeisen-Filter
 

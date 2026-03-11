@@ -38,14 +38,15 @@ log = logging.getLogger("tally_votes")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vote_state.json")
 
 
-def load_state() -> tuple[list[RecipeCandidate], str]:
-    """Load candidates and message_id from state file."""
+def load_state() -> tuple[list[RecipeCandidate], str, int | None]:
+    """Load candidates, message_id and min_update_id from state file."""
     with open(STATE_FILE) as f:
         state = json.load(f)
 
     candidates = [RecipeCandidate(**c) for c in state["candidates"]]
     message_id = state.get("message_id", "")
-    return candidates, message_id
+    min_update_id = state.get("last_update_id_before_vote")
+    return candidates, message_id, min_update_id
 
 
 async def main():
@@ -53,11 +54,12 @@ async def main():
         log.error("No vote_state.json found. Phase 1 hasn't run yet.")
         sys.exit(1)
 
-    candidates, message_id = load_state()
-    log.info("Loaded %d candidates from state", len(candidates))
+    candidates, message_id, min_update_id = load_state()
+    log.info("Loaded %d candidates from state (min_update_id=%s)",
+             len(candidates), min_update_id)
 
-    # Collect all votes (single pass)
-    votes = collect_all_votes_once()
+    # Collect all votes (single pass), ignoring updates before the vote was sent
+    votes = collect_all_votes_once(min_update_id=min_update_id)
 
     if not votes or all(len(v) == 0 for v in votes.values()):
         log.info("No votes received.")
@@ -75,17 +77,13 @@ async def main():
         return
 
     # Determine winner
-    winner_id = max(votes, key=lambda rid: len(votes[rid]))
-    winner_voters = votes[winner_id]
-    winner = next((c for c in candidates if c.id == winner_id), None)
-
-    if not winner:
-        log.error("Winner %s not in candidates!", winner_id)
+    from voting import determine_winner
+    try:
+        winner, winner_voters, is_tie, tied_names = determine_winner(votes, candidates)
+    except ValueError as e:
+        log.error(str(e))
         os.remove(STATE_FILE)
         return
-
-    log.info("Winner: %s (%d votes from: %s)",
-             winner.name, len(winner_voters), ", ".join(winner_voters))
 
     # Add to Cookidoo shopping list
     try:
@@ -95,7 +93,11 @@ async def main():
         ingredients = winner.ingredients
 
     # Send result
-    send_result(TELEGRAM_CHAT_ID, winner, winner_voters, ingredients)
+    send_result(TELEGRAM_CHAT_ID, winner, winner_voters, ingredients,
+                is_tie=is_tie, tied_names=tied_names)
+
+    from cookidoo_client import save_winner_to_history
+    save_winner_to_history(winner.id, winner.name)
     log.info("Done! Guten Appetit!")
 
     # Print result as JSON
@@ -105,6 +107,7 @@ async def main():
         "winner_id": winner.id,
         "voters": winner_voters,
         "ingredients": ingredients,
+        "is_tie": is_tie,
     }, ensure_ascii=False))
 
     # Clean up

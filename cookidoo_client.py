@@ -1,21 +1,17 @@
 """Cookidoo client wrapper – fetches recipes, details, and builds shopping lists."""
 
 import asyncio
+import json
 import random
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 import aiohttp
 from cookidoo_api import (
     Cookidoo,
     CookidooConfig,
     CookidooLocalizationConfig,
-    CookidooCollection,
-    CookidooChapterRecipe,
-    CookidooShoppingRecipe,
-    CookidooShoppingRecipeDetails,
-    CookidooIngredientItem,
-    CookidooIngredient,
 )
 
 from config import (
@@ -25,6 +21,8 @@ from config import (
     COOKIDOO_LANGUAGE,
     COOKIDOO_URL,
     MAX_DIFFICULTY,
+    RECIPE_HISTORY_FILE,
+    RECIPE_HISTORY_DAYS,
 )
 
 log = logging.getLogger(__name__)
@@ -143,12 +141,51 @@ async def _get_all_collection_recipe_ids(api: Cookidoo) -> list[tuple[str, str]]
     return unique
 
 
+def _load_recent_winner_ids() -> set[str]:
+    """Load recipe IDs that won within the last RECIPE_HISTORY_DAYS days."""
+    try:
+        with open(RECIPE_HISTORY_FILE) as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+    cutoff = (date.today() - timedelta(days=RECIPE_HISTORY_DAYS)).isoformat()
+    return {entry["id"] for entry in history if entry.get("date", "") >= cutoff}
+
+
+def save_winner_to_history(recipe_id: str, recipe_name: str) -> None:
+    """Append today's winner to the history file."""
+    try:
+        with open(RECIPE_HISTORY_FILE) as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        history = []
+
+    history.append({
+        "id": recipe_id,
+        "name": recipe_name,
+        "date": date.today().isoformat(),
+    })
+
+    # Prune entries older than RECIPE_HISTORY_DAYS
+    cutoff = (date.today() - timedelta(days=RECIPE_HISTORY_DAYS)).isoformat()
+    history = [e for e in history if e.get("date", "") >= cutoff]
+
+    with open(RECIPE_HISTORY_FILE, "w") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    log.info("Saved winner '%s' to history (%d entries)", recipe_name, len(history))
+
+
 async def fetch_candidates(num: int = 7) -> list[RecipeCandidate]:
     """
     Fetch `num` recipe candidates from the user's Cookidoo collections.
-    Filters by max difficulty and picks a random subset.
+    Filters by max difficulty, recent winners, and picks a random subset.
     """
     max_rank = DIFFICULTY_RANK.get(MAX_DIFFICULTY.lower(), 2)
+    recent_ids = _load_recent_winner_ids()
+    if recent_ids:
+        log.info("Excluding %d recent winners from last %d days", len(recent_ids), RECIPE_HISTORY_DAYS)
 
     async with aiohttp.ClientSession() as session:
         api = Cookidoo(session, _make_config())
@@ -162,9 +199,15 @@ async def fetch_candidates(num: int = 7) -> list[RecipeCandidate]:
             log.warning("No recipes found in collections!")
             return []
 
+        # Remove recent winners from the pool
+        pool = [(rid, rname) for rid, rname in all_recipes if rid not in recent_ids]
+        if not pool:
+            log.warning("All recipes were recent winners — using full pool as fallback")
+            pool = all_recipes
+
         # Shuffle and pick up to 3× candidates (we'll filter by difficulty)
-        sample_size = min(len(all_recipes), num * 3)
-        sample = random.sample(all_recipes, sample_size)
+        sample_size = min(len(pool), num * 3)
+        sample = random.sample(pool, sample_size)
 
         candidates: list[RecipeCandidate] = []
         for rid, rname in sample:
@@ -183,22 +226,10 @@ async def fetch_candidates(num: int = 7) -> list[RecipeCandidate]:
                     log.debug("Skipping sweet: %s", rname)
                     continue
 
-                # Build ingredient list from the shopping list API
-                # We temporarily add the recipe, read ingredients, then remove it
-                ingredient_items = await api.add_ingredient_items_for_recipes([rid])
-                shopping_recipes = await api.get_shopping_list_recipes()
-
+                # Ingredients are loaded lazily – only for the winner in
+                # add_to_shopping_list(). This avoids 3 extra API calls per
+                # candidate (add → read → remove).
                 ingredients: list[str] = []
-                for sr in shopping_recipes:
-                    if sr.id == rid:
-                        ingredients = [
-                            f"{ing.description} {ing.name}".strip()
-                            for ing in sr.ingredients
-                        ]
-                        break
-
-                # Clean up: remove from shopping list
-                await api.remove_ingredient_items_for_recipes([rid])
 
                 recipe_url = f"{COOKIDOO_URL}/recipes/recipe/{COOKIDOO_LANGUAGE}/{rid}"
 

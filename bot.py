@@ -113,15 +113,12 @@ async def run():
         return
 
     # ── Step 4: Determine winner ─────────────────────────────
-    winner_id = max(votes, key=lambda rid: len(votes[rid]))
-    winner_voters = votes[winner_id]
-    winner = next((c for c in candidates if c.id == winner_id), None)
-
-    if not winner:
-        log.error("Winner recipe %s not found in candidates?!", winner_id)
+    from voting import determine_winner
+    try:
+        winner, winner_voters, is_tie, tied_names = determine_winner(votes, candidates)
+    except ValueError as e:
+        log.error(str(e))
         return
-
-    log.info("Winner: %s with %d votes", winner.name, len(winner_voters))
 
     # ── Step 5: Build shopping list ──────────────────────────
     log.info("Adding ingredients to Cookidoo shopping list ...")
@@ -132,7 +129,11 @@ async def run():
         ingredients = winner.ingredients  # Fallback to cached ingredients
 
     # ── Step 6: Send result ──────────────────────────────────
-    send_result(TELEGRAM_CHAT_ID, winner, winner_voters, ingredients)
+    send_result(TELEGRAM_CHAT_ID, winner, winner_voters, ingredients,
+                is_tie=is_tie, tied_names=tied_names)
+
+    from cookidoo_client import save_winner_to_history
+    save_winner_to_history(winner.id, winner.name)
     log.info("Done! Bon appétit!")
 
 

@@ -28,7 +28,7 @@ from config import (
     VOTING_DURATION_MAX_MINUTES,
 )
 from cookidoo_client import fetch_candidates
-from telegram_client import send_vote, send_error_message
+from telegram_client import send_vote, send_error_message, get_updates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,12 +88,18 @@ async def main():
     except Exception as e:
         log.info("No voting duration override applied: %s", e)
 
+    # Snapshot the current update_id before sending the vote.
+    # Phase 2 uses this to ignore any older/stale updates.
+    snapshot = get_updates(limit=1, timeout=0)
+    last_update_id_before_vote = snapshot[-1]["update_id"] if snapshot else None
+
     # Send vote
     msg_id = send_vote(TELEGRAM_CHAT_ID, candidates, voting_minutes)
 
     # Save state
     state = {
         "message_id": msg_id,
+        "last_update_id_before_vote": last_update_id_before_vote,
         "candidates": [
             {
                 "id": c.id,

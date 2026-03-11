@@ -276,10 +276,16 @@ def collect_votes(voting_minutes: int) -> dict[str, list[str]]:
     return result
 
 
-def collect_all_votes_once() -> dict[str, list[str]]:
+def collect_all_votes_once(
+    min_update_id: int | None = None,
+) -> dict[str, list[str]]:
     """
     Do a single pass through all pending Telegram updates.
     Used by Phase 2 (tally) to collect votes after the voting window.
+
+    If min_update_id is given, updates with update_id <= min_update_id
+    are ignored (they predate the current vote).
+
     Returns {recipe_id: [voter_first_name, ...]}.
     """
     user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
@@ -301,6 +307,9 @@ def collect_all_votes_once() -> dict[str, list[str]]:
                     update_id = update.get("update_id")
                     if update_id is not None:
                         last_offset = update_id + 1
+                    if min_update_id is not None and update_id is not None:
+                        if update_id <= min_update_id:
+                            continue
                     _process_update(update, user_votes)
         else:
             # External connector: use autoPaging
@@ -311,6 +320,10 @@ def collect_all_votes_once() -> dict[str, list[str]]:
             if not isinstance(updates, list):
                 updates = []
             for update in updates:
+                update_id = update.get("update_id")
+                if min_update_id is not None and update_id is not None:
+                    if update_id <= min_update_id:
+                        continue
                 _process_update(update, user_votes)
 
     except Exception as e:
@@ -381,13 +394,22 @@ def resolve_number_votes(
 # ─── Result messages ────────────────────────────────────────
 
 def send_result(chat_id: str, winner: RecipeCandidate, voters: list[str],
-                ingredients: list[str]) -> None:
+                ingredients: list[str], *,
+                is_tie: bool = False,
+                tied_names: list[str] | None = None) -> None:
     """Send the voting result and shopping list to the chat."""
     voter_text = ", ".join(voters) if voters else "niemand"
 
     lines = [
         "\U0001f3c6 *Ergebnis der Abstimmung*\n",
         f"\U0001f37d *{_escape_md(winner.name)}* hat gewonnen\\!",
+    ]
+
+    if is_tie and tied_names:
+        names_text = _escape_md(", ".join(tied_names))
+        lines.append(f"\U0001f3b2 Gleichstand mit {names_text} \u2013 das Los hat entschieden\\!")
+
+    lines.extend([
         f"Gew\u00e4hlt von: {_escape_md(voter_text)}\n",
         f"\u23F1 Gesamtzeit: {_escape_md(_format_time(winner.total_time))}",
         f"\U0001f37d Portionen: {winner.serving_size}\n",

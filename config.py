@@ -25,3 +25,10 @@ VOTING_DURATION_MAX_MINUTES = int(os.environ.get("VOTING_DURATION_MAX_MINUTES", 
 
 # Max difficulty level to include (easy/medium/difficult)
 MAX_DIFFICULTY = os.environ.get("MAX_DIFFICULTY", "medium")
+
+# ─── Recipe History ───────────────────────────────────────────
+RECIPE_HISTORY_FILE = os.environ.get(
+    "RECIPE_HISTORY_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "recipe_history.json"),
+)
+RECIPE_HISTORY_DAYS = int(os.environ.get("RECIPE_HISTORY_DAYS", "14"))
