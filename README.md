@@ -26,8 +26,6 @@ Falls noch nicht geschehen:
 2. Sende `/newbot` und folge den Anweisungen
 3. Notiere dir den **Bot-Token**
 
-Der Bot „Inspirito" (`@Inspirito_Bot`) ist bereits mit deinem Account verbunden.
-
 ### 2. Familien-Gruppenchat vorbereiten
 
 1. Erstelle eine Telegram-Gruppe (oder verwende eine bestehende)

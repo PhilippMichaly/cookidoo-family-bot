@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("feature_listener")
 
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-5106621509")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TRIGGER_COMMANDS = ("/wunsch", "/feature", "/idee")
 
 
