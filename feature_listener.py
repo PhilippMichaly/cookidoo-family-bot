@@ -108,7 +108,7 @@ def check_for_requests() -> list[dict]:
                     f"\u2705 Danke, {_escape_md(request['from'])}\\!\n\n"
                     f"Dein Wunsch:\n"
                     f"\u201E{_escape_md(request_text)}\u201C\n\n"
-                    f"\U0001f6e0 Wird jetzt umgesetzt\\.\\.\\."
+                    f"\U0001f551 Wird innerhalb der n\u00e4chsten Stunde umgesetzt\\."
                 )
                 _call_telegram(
                     "telegram_bot_api-send-text-message-or-reply",
