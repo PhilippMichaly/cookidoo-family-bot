@@ -2,15 +2,14 @@
 """
 Feature-Request Listener
 =========================
-Checks Telegram for messages starting with /wunsch or /feature
-and stores them. Designed to run as a periodic cron job.
+Checks Telegram for messages starting with /wunsch, /feature or /idee.
+Confirms receipt in the chat and prints the request as JSON so the
+cron agent can pick it up and implement the change.
 
 Usage in chat:
   /wunsch Rezepte nach Saison filtern
   /feature Einkaufsliste per WhatsApp teilen
-  /wunsch Portionen anpassen können
-
-The bot replies with a confirmation and saves the request to a JSON file.
+  /idee Portionen anpassen können
 """
 
 import json
@@ -28,19 +27,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("feature_listener")
 
-REQUESTS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "feature_requests.json"
-)
-
-# Telegram group chat ID
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-5106621509")
-
-# Commands that trigger a feature request
 TRIGGER_COMMANDS = ("/wunsch", "/feature", "/idee")
 
 
 def _call_telegram(tool_name: str, arguments: dict) -> dict | list:
-    """Call a Telegram tool via the external-tool CLI."""
     payload = json.dumps({
         "source_id": "telegram_bot_api__pipedream",
         "tool_name": tool_name,
@@ -56,7 +47,6 @@ def _call_telegram(tool_name: str, arguments: dict) -> dict | list:
 
 
 def _escape_md(text: str) -> str:
-    """Escape special characters for MarkdownV2."""
     special = r"_*[]()~`>#+-=|{}.!"
     result = ""
     for ch in text:
@@ -67,25 +57,8 @@ def _escape_md(text: str) -> str:
     return result
 
 
-def load_requests() -> list[dict]:
-    """Load existing feature requests from file."""
-    if os.path.exists(REQUESTS_FILE):
-        with open(REQUESTS_FILE) as f:
-            return json.load(f)
-    return []
-
-
-def save_requests(requests: list[dict]) -> None:
-    """Save feature requests to file."""
-    with open(REQUESTS_FILE, "w") as f:
-        json.dump(requests, f, ensure_ascii=False, indent=2)
-
-
 def check_for_requests() -> list[dict]:
-    """
-    Check Telegram updates for feature request commands.
-    Returns list of new requests found.
-    """
+    """Check Telegram for feature request commands. Returns new requests."""
     new_requests = []
 
     try:
@@ -104,16 +77,13 @@ def check_for_requests() -> list[dict]:
             text = (msg.get("text") or "").strip()
             text_lower = text.lower()
 
-            # Check if message starts with a trigger command
-            triggered = False
+            request_text = None
             for cmd in TRIGGER_COMMANDS:
                 if text_lower.startswith(cmd):
-                    # Extract the actual request (after the command)
                     request_text = text[len(cmd):].strip()
-                    triggered = True
                     break
 
-            if not triggered or not request_text:
+            if not request_text:
                 continue
 
             user = msg.get("from", {})
@@ -124,31 +94,27 @@ def check_for_requests() -> list[dict]:
                 "from": user.get("first_name", "Unbekannt"),
                 "user_id": str(user.get("id", "")),
                 "chat_id": str(chat.get("id", "")),
+                "message_id": str(msg.get("message_id", "")),
                 "date": datetime.fromtimestamp(
                     msg.get("date", 0), tz=timezone.utc
                 ).isoformat(),
-                "status": "neu",
             }
-
             new_requests.append(request)
-            log.info(
-                "Feature request from %s: %s",
-                request["from"], request_text,
-            )
+            log.info("Feature request from %s: %s", request["from"], request_text)
 
-            # Send confirmation reply
+            # Confirm in chat
             try:
-                reply_text = (
-                    f"\u2705 Danke, {_escape_md(request['from'])}\\! "
-                    f"Dein Wunsch wurde gespeichert:\n\n"
+                reply = (
+                    f"\u2705 Danke, {_escape_md(request['from'])}\\!\n\n"
+                    f"Dein Wunsch:\n"
                     f"\u201E{_escape_md(request_text)}\u201C\n\n"
-                    f"Philipp wird benachrichtigt\\."
+                    f"\U0001f6e0 Wird jetzt umgesetzt\\.\\.\\."
                 )
                 _call_telegram(
                     "telegram_bot_api-send-text-message-or-reply",
                     {
                         "chatId": str(chat.get("id", CHAT_ID)),
-                        "text": reply_text,
+                        "text": reply,
                         "parse_mode": "MarkdownV2",
                         "reply_to_message_id": str(msg.get("message_id", "")),
                     },
@@ -163,29 +129,11 @@ def check_for_requests() -> list[dict]:
 
 
 def main():
-    """Main entry point: check for new requests and save them."""
     new_requests = check_for_requests()
-
-    if not new_requests:
-        log.info("No new feature requests.")
-        # Print empty JSON for cron agent to detect "nothing new"
-        print(json.dumps({"new_requests": 0}))
-        return
-
-    # Load existing and append new
-    all_requests = load_requests()
-    all_requests.extend(new_requests)
-    save_requests(all_requests)
-
-    log.info("Saved %d new request(s), total: %d", len(new_requests), len(all_requests))
-
-    # Print summary for cron agent to pick up and notify
+    # Output as JSON for the cron agent to process
     print(json.dumps({
         "new_requests": len(new_requests),
-        "requests": [
-            {"from": r["from"], "text": r["text"]}
-            for r in new_requests
-        ],
+        "requests": new_requests,
     }, ensure_ascii=False))
 
 
