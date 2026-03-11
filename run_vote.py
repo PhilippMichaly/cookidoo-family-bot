@@ -25,6 +25,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     NUM_RECIPE_CANDIDATES,
     VOTING_DURATION_MINUTES,
+    VOTING_DURATION_MAX_MINUTES,
 )
 from cookidoo_client import fetch_candidates
 from telegram_client import send_vote, send_error_message
@@ -65,8 +66,30 @@ async def main():
         send_error_message(TELEGRAM_CHAT_ID, "Keine Rezepte gefunden.")
         sys.exit(1)
 
+    # Determine voting duration:
+    # - default from env
+    # - optionally overridden by a Telegram feature request like "bis 17:00"
+    voting_minutes = VOTING_DURATION_MINUTES
+
+    try:
+        # Keep this optional and robust; if anything fails we fall back
+        # to the configured default.
+        from feature_requests import parse_feature_request, compute_voting_minutes_until
+        from telegram_client import get_last_feature_request
+
+        fr_text = get_last_feature_request(TELEGRAM_CHAT_ID)
+        actions = parse_feature_request(fr_text)
+        if actions.requested_end_time_local:
+            requested = compute_voting_minutes_until(actions.requested_end_time_local)
+            if 1 <= requested <= VOTING_DURATION_MAX_MINUTES:
+                voting_minutes = requested
+                log.info("Voting duration overridden by request '%s' -> %d minutes",
+                         actions.requested_end_time_local, voting_minutes)
+    except Exception as e:
+        log.info("No voting duration override applied: %s", e)
+
     # Send vote
-    msg_id = send_vote(TELEGRAM_CHAT_ID, candidates, VOTING_DURATION_MINUTES)
+    msg_id = send_vote(TELEGRAM_CHAT_ID, candidates, voting_minutes)
 
     # Save state
     state = {

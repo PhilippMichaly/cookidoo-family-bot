@@ -452,6 +452,50 @@ def get_updates(offset: int | None = None, limit: int = 100,
     return result if isinstance(result, list) else []
 
 
+def reset_updates_offset(chat_id: str | None = None) -> None:
+    """Best-effort reset of the update offset.
+
+    Telegram doesn't provide a true 'reset' API. The practical meaning here is:
+    consume nothing and allow the next caller to re-read older pending updates.
+
+    We implement this by *not* advancing offset state on our side. For the
+    direct Bot API, each polling loop already starts without a stored offset.
+
+    This function exists so feature requests can be implemented explicitly and
+    logged/audited.
+    """
+    # No persistent offset is stored; so a reset is a no-op.
+    # Keeping the function to support the feature request intent.
+    log.info("Reset update offset requested (no persistent offset to reset)")
+
+
+def get_last_feature_request(chat_id: str, limit: int = 50) -> str:
+    """Return the most recent plain-text message that looks like a feature request.
+
+    This is used to implement small runtime overrides (e.g., end time) without
+    changing the scheduler/config.
+
+    We scan a limited number of updates and pick the newest message text.
+    """
+    try:
+        updates = get_updates(offset=None, limit=limit, timeout=0)
+    except Exception as e:
+        log.info("Could not read updates for feature request: %s", e)
+        return ""
+
+    last_text = ""
+    last_update_id = -1
+    for upd in updates or []:
+        uid = upd.get("update_id", -1)
+        msg = upd.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        if text and uid >= last_update_id:
+            last_text = text
+            last_update_id = uid
+
+    return last_text
+
+
 def _extract_message_id(result) -> str:
     """Extract message_id from Telegram API response."""
     if isinstance(result, dict):

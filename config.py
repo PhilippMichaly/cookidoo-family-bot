@@ -19,5 +19,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 NUM_RECIPE_CANDIDATES = int(os.environ.get("NUM_RECIPE_CANDIDATES", "7"))
 VOTING_DURATION_MINUTES = int(os.environ.get("VOTING_DURATION_MINUTES", "120"))
 
+# Allow users to request a different voting end time (local time) via Telegram,
+# e.g. "Liste bis 17:00 laufen lassen".
+VOTING_DURATION_MAX_MINUTES = int(os.environ.get("VOTING_DURATION_MAX_MINUTES", "720"))
+
 # Max difficulty level to include (easy/medium/difficult)
 MAX_DIFFICULTY = os.environ.get("MAX_DIFFICULTY", "medium")
