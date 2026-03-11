@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+vote_state.json
+last_candidates.json
+*.egg-info/
+.venv/

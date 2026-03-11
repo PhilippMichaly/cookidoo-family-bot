@@ -1,0 +1,2 @@
+cookidoo-api>=0.15.0
+aiohttp>=3.9.0
