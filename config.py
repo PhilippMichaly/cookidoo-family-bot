@@ -10,8 +10,9 @@ COOKIDOO_LANGUAGE = os.environ.get("COOKIDOO_LANGUAGE", "de-DE")  # de-DE, de-AT
 COOKIDOO_URL = os.environ.get("COOKIDOO_URL", "https://cookidoo.de/foundation/de-DE")
 
 # ─── Telegram ───────────────────────────────────────────────
-# Chat ID for the family group (or private chat for testing).
-# Use /chatid command with the bot or check get_updates.
+# Bot token from @BotFather
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# Chat ID for the family group (use setup_chat_id.py to find it)
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ─── Voting ─────────────────────────────────────────────────

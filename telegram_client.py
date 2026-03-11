@@ -1,30 +1,40 @@
-"""Telegram client – sends votes with inline buttons, collects results."""
+"""Telegram client – sends votes with inline buttons, collects results.
+
+Uses the Telegram Bot API directly via HTTPS (no external connectors needed).
+Requires TELEGRAM_BOT_TOKEN to be set in the environment.
+"""
 
 import json
 import logging
-import subprocess
 import time
 
+import requests as http
+
+from config import TELEGRAM_BOT_TOKEN
 from cookidoo_client import RecipeCandidate
 
 log = logging.getLogger(__name__)
 
+# ─── Telegram Bot API base ──────────────────────────────────
 
-def _call_telegram(tool_name: str, arguments: dict) -> dict | list:
-    """Call a Telegram tool via the external-tool CLI."""
-    payload = json.dumps({
-        "source_id": "telegram_bot_api__pipedream",
-        "tool_name": tool_name,
-        "arguments": arguments,
-    })
-    result = subprocess.run(
-        ["external-tool", "call", payload],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Telegram API error: {result.stderr}")
-    return json.loads(result.stdout)
+def _api_url(method: str) -> str:
+    """Build Telegram Bot API URL for a given method."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
+
+def _call_telegram(method: str, params: dict | None = None) -> dict | list:
+    """Call a Telegram Bot API method via HTTPS POST."""
+    r = http.post(_api_url(method), json=params or {}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data.get("result", {})
+
+
+# ─── Helpers ────────────────────────────────────────────────
 
 def _format_time(seconds: int) -> str:
     """Format seconds to a human-readable German time string."""
@@ -69,6 +79,8 @@ def _escape_md(text: str) -> str:
     return result
 
 
+# ─── Voting ─────────────────────────────────────────────────
+
 def send_vote(chat_id: str, candidates: list[RecipeCandidate],
               voting_minutes: int) -> str:
     """
@@ -105,19 +117,14 @@ def send_vote(chat_id: str, candidates: list[RecipeCandidate],
             "callback_data": f"vote:{r.id}",
         }])
 
-    reply_markup = json.dumps({"inline_keyboard": keyboard})
+    result = _call_telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+        "reply_markup": json.dumps({"inline_keyboard": keyboard}),
+    })
 
-    result = _call_telegram(
-        "telegram_bot_api-send-text-message-or-reply",
-        {
-            "chatId": chat_id,
-            "text": text,
-            "parse_mode": "MarkdownV2",
-            "reply_markup": reply_markup,
-        },
-    )
-
-    msg_id = _extract_message_id(result)
+    msg_id = str(result.get("message_id", ""))
     log.info("Vote message sent, message_id=%s", msg_id)
     return msg_id
 
@@ -142,11 +149,11 @@ def collect_votes(voting_minutes: int) -> dict[str, list[str]]:
 
     while time.time() < end_time:
         try:
-            args: dict = {"limit": 100}
+            params: dict = {"limit": 100, "timeout": 5}
             if last_offset is not None:
-                args["offset"] = str(last_offset)
+                params["offset"] = last_offset
 
-            updates = _call_telegram("telegram_bot_api-list-updates", args)
+            updates = _call_telegram("getUpdates", params)
             if not isinstance(updates, list):
                 updates = []
 
@@ -174,6 +181,14 @@ def collect_votes(voting_minutes: int) -> dict[str, list[str]]:
                         else:
                             user_votes[user_id] = (recipe_id, first_name)
                             log.info("Vote from %s for %s", first_name, recipe_id)
+
+                        # Answer callback to remove loading indicator
+                        try:
+                            _call_telegram("answerCallbackQuery", {
+                                "callback_query_id": cb.get("id"),
+                            })
+                        except Exception:
+                            pass
 
                 # Also handle text replies like "3" as fallback
                 msg = update.get("message", {})
@@ -203,6 +218,72 @@ def collect_votes(voting_minutes: int) -> dict[str, list[str]]:
     return result
 
 
+def collect_all_votes_once() -> dict[str, list[str]]:
+    """
+    Do a single pass through all pending Telegram updates.
+    Used by Phase 2 (tally) to collect votes after the voting window.
+    Returns {recipe_id: [voter_first_name, ...]}.
+    """
+    user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
+    last_offset: int | None = None
+
+    try:
+        # Fetch all pending updates (multiple pages if needed)
+        while True:
+            params: dict = {"limit": 100, "timeout": 0}
+            if last_offset is not None:
+                params["offset"] = last_offset
+
+            updates = _call_telegram("getUpdates", params)
+            if not isinstance(updates, list) or not updates:
+                break
+
+            for update in updates:
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    last_offset = update_id + 1
+
+                # Handle callback_query (inline button press)
+                cb = update.get("callback_query")
+                if cb:
+                    data = cb.get("data", "")
+                    if data.startswith("vote:"):
+                        recipe_id = data.split(":", 1)[1]
+                        user = cb.get("from", {})
+                        user_id = str(user.get("id", ""))
+                        first_name = user.get("first_name", "Unbekannt")
+                        if user_id not in user_votes:
+                            user_votes[user_id] = (recipe_id, first_name)
+                            log.info("Vote: %s -> %s", first_name, recipe_id)
+                        else:
+                            log.info("Duplicate vote from %s ignored", first_name)
+
+                # Handle text replies like "3"
+                msg = update.get("message", {})
+                if msg:
+                    text = (msg.get("text") or "").strip()
+                    if text.isdigit():
+                        user = msg.get("from", {})
+                        user_id = str(user.get("id", ""))
+                        first_name = user.get("first_name", "Unbekannt")
+                        if user_id not in user_votes:
+                            user_votes[user_id] = (f"number:{text}", first_name)
+                            log.info("Text vote: %s -> %s", first_name, text)
+                        else:
+                            log.info("Duplicate text vote from %s ignored", first_name)
+
+    except Exception as e:
+        log.warning("Error fetching updates: %s", e)
+
+    # Aggregate
+    result: dict[str, list[str]] = {}
+    for uid, (recipe_id, name) in user_votes.items():
+        result.setdefault(recipe_id, [])
+        result[recipe_id].append(name)
+
+    return result
+
+
 def resolve_number_votes(
     votes: dict[str, list[str]],
     candidates: list[RecipeCandidate],
@@ -223,6 +304,8 @@ def resolve_number_votes(
             resolved[key].extend(names)
     return resolved
 
+
+# ─── Result messages ────────────────────────────────────────
 
 def send_result(chat_id: str, winner: RecipeCandidate, voters: list[str],
                 ingredients: list[str]) -> None:
@@ -248,52 +331,49 @@ def send_result(chat_id: str, winner: RecipeCandidate, voters: list[str],
 
     text = "\n".join(lines)
 
-    _call_telegram(
-        "telegram_bot_api-send-text-message-or-reply",
-        {
-            "chatId": chat_id,
-            "text": text,
-            "parse_mode": "MarkdownV2",
-        },
-    )
+    _call_telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+    })
     log.info("Result message sent for %s", winner.name)
 
 
 def send_no_votes_message(chat_id: str) -> None:
     """Send a message when nobody voted."""
-    _call_telegram(
-        "telegram_bot_api-send-text-message-or-reply",
-        {
-            "chatId": chat_id,
-            "text": (
-                "\U0001f615 Leider hat niemand abgestimmt\\. "
-                "N\u00e4chstes Mal vielleicht\\!"
-            ),
-            "parse_mode": "MarkdownV2",
-        },
-    )
+    _call_telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            "\U0001f615 Leider hat niemand abgestimmt\\. "
+            "N\u00e4chstes Mal vielleicht\\!"
+        ),
+        "parse_mode": "MarkdownV2",
+    })
 
 
 def send_error_message(chat_id: str, error: str) -> None:
     """Send an error message to the chat."""
-    _call_telegram(
-        "telegram_bot_api-send-text-message-or-reply",
-        {
-            "chatId": chat_id,
-            "text": f"\u26A0\uFE0F Fehler beim Rezept\\-Bot: {_escape_md(error)}",
-            "parse_mode": "MarkdownV2",
-        },
-    )
+    _call_telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": f"\u26A0\uFE0F Fehler beim Rezept\\-Bot: {_escape_md(error)}",
+        "parse_mode": "MarkdownV2",
+    })
 
 
-def _extract_message_id(result) -> str:
-    """Extract message_id from Telegram API response."""
-    if isinstance(result, dict):
-        if "message_id" in result:
-            return str(result["message_id"])
-        if "result" in result and isinstance(result["result"], dict):
-            return str(result["result"].get("message_id", ""))
-        rv = result.get("$return_value", {})
-        if isinstance(rv, dict):
-            return str(rv.get("message_id", ""))
-    return ""
+def send_message(chat_id: str, text: str, **kwargs) -> dict:
+    """Send a plain text message (convenience wrapper)."""
+    return _call_telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        **kwargs,
+    })
+
+
+def get_updates(offset: int | None = None, limit: int = 100,
+                timeout: int = 0) -> list:
+    """Get pending updates from the Telegram Bot API."""
+    params = {"limit": limit, "timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    result = _call_telegram("getUpdates", params)
+    return result if isinstance(result, list) else []

@@ -3,8 +3,8 @@
 Feature-Request Listener
 =========================
 Checks Telegram for messages starting with /wunsch, /feature or /idee.
-Confirms receipt in the chat and prints the request as JSON so the
-cron agent can pick it up and implement the change.
+Confirms receipt in the chat and prints the request as JSON for
+further processing (e.g. by a cron job or CI pipeline).
 
 Usage in chat:
   /wunsch Rezepte nach Saison filtern
@@ -15,11 +15,13 @@ Usage in chat:
 import json
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from telegram_client import get_updates, send_message, _escape_md
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,34 +29,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("feature_listener")
 
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TRIGGER_COMMANDS = ("/wunsch", "/feature", "/idee")
-
-
-def _call_telegram(tool_name: str, arguments: dict) -> dict | list:
-    payload = json.dumps({
-        "source_id": "telegram_bot_api__pipedream",
-        "tool_name": tool_name,
-        "arguments": arguments,
-    })
-    result = subprocess.run(
-        ["external-tool", "call", payload],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Telegram API error: {result.stderr}")
-    return json.loads(result.stdout)
-
-
-def _escape_md(text: str) -> str:
-    special = r"_*[]()~`>#+-=|{}.!"
-    result = ""
-    for ch in text:
-        if ch in special:
-            result += f"\\{ch}"
-        else:
-            result += ch
-    return result
 
 
 def check_for_requests() -> list[dict]:
@@ -62,12 +37,7 @@ def check_for_requests() -> list[dict]:
     new_requests = []
 
     try:
-        updates = _call_telegram("telegram_bot_api-list-updates", {
-            "limit": 100,
-            "autoPaging": True,
-        })
-        if not isinstance(updates, list):
-            updates = []
+        updates = get_updates(limit=100)
 
         for update in updates:
             msg = update.get("message", {})
@@ -110,14 +80,11 @@ def check_for_requests() -> list[dict]:
                     f"\u201E{_escape_md(request_text)}\u201C\n\n"
                     f"\U0001f551 Wird innerhalb der n\u00e4chsten Stunde umgesetzt\\."
                 )
-                _call_telegram(
-                    "telegram_bot_api-send-text-message-or-reply",
-                    {
-                        "chatId": str(chat.get("id", CHAT_ID)),
-                        "text": reply,
-                        "parse_mode": "MarkdownV2",
-                        "reply_to_message_id": str(msg.get("message_id", "")),
-                    },
+                send_message(
+                    str(chat.get("id", TELEGRAM_CHAT_ID)),
+                    reply,
+                    parse_mode="MarkdownV2",
+                    reply_to_message_id=str(msg.get("message_id", "")),
                 )
             except Exception as e:
                 log.warning("Could not send confirmation: %s", e)
@@ -129,8 +96,12 @@ def check_for_requests() -> list[dict]:
 
 
 def main():
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN is not set")
+        sys.exit(1)
+
     new_requests = check_for_requests()
-    # Output as JSON for the cron agent to process
+    # Output as JSON for further processing
     print(json.dumps({
         "new_requests": len(new_requests),
         "requests": new_requests,

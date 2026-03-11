@@ -12,9 +12,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 from config import (
     COOKIDOO_EMAIL,
     TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN,
     NUM_RECIPE_CANDIDATES,
     VOTING_DURATION_MINUTES,
 )
@@ -31,8 +39,17 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vote_stat
 
 
 async def main():
-    if not COOKIDOO_EMAIL or not TELEGRAM_CHAT_ID:
-        log.error("Missing COOKIDOO_EMAIL or TELEGRAM_CHAT_ID")
+    # Validate config
+    missing = []
+    if not COOKIDOO_EMAIL:
+        missing.append("COOKIDOO_EMAIL")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        log.error("Missing environment variables: %s", ", ".join(missing))
+        log.error("Copy .env.example to .env and fill in your values.")
         sys.exit(1)
 
     # Fetch candidates

@@ -2,43 +2,44 @@
 """
 Helper: Discover your Telegram Chat ID.
 
-Run this script, then send a message to your bot in Telegram
-(either privately or in your family group). The script will
-print the chat_id you need for config.
+1. Run this script
+2. Send a message to your bot in Telegram (in a group or private chat)
+3. The script prints the chat_id you need for your .env file
+
+Requires TELEGRAM_BOT_TOKEN to be set (via .env or environment variable).
 """
 
-import json
-import subprocess
-import time
+import os
 import sys
+import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def call_telegram(tool_name, arguments):
-    payload = json.dumps({
-        "source_id": "telegram_bot_api__pipedream",
-        "tool_name": tool_name,
-        "arguments": arguments,
-    })
-    result = subprocess.run(
-        ["external-tool", "call", payload],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-    return json.loads(result.stdout)
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from config import TELEGRAM_BOT_TOKEN
+from telegram_client import get_updates
 
 
 def main():
-    print("🔍 Listening for Telegram messages ...")
-    print("   Send any message to the bot (in a group or private chat).")
-    print("   Press Ctrl+C to stop.\n")
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN ist nicht gesetzt!")
+        print("   Setze den Token in deiner .env-Datei oder als Umgebungsvariable.")
+        sys.exit(1)
+
+    print("🔍 Warte auf Telegram-Nachrichten ...")
+    print("   Sende eine Nachricht an den Bot (in einer Gruppe oder privat).")
+    print("   Drücke Ctrl+C zum Beenden.\n")
 
     seen = set()
     while True:
         try:
-            updates = call_telegram("telegram_bot_api-list-updates", {"limit": 100})
-            if not isinstance(updates, list):
-                updates = []
+            updates = get_updates(limit=100, timeout=5)
 
             for u in updates:
                 uid = u.get("update_id")
@@ -46,13 +47,19 @@ def main():
                     continue
                 seen.add(uid)
 
-                chat = u.get("chat", {}) or u.get("message", {}).get("chat", {})
+                # Extract chat from message or callback_query
+                msg = u.get("message", {}) or {}
+                chat = msg.get("chat", {})
+                if not chat:
+                    cb = u.get("callback_query", {}) or {}
+                    chat = (cb.get("message", {}) or {}).get("chat", {})
+
                 if chat:
                     chat_id = chat.get("id")
                     chat_type = chat.get("type", "?")
                     title = chat.get("title") or chat.get("first_name", "?")
                     print(f"  ✅ Chat gefunden: '{title}' (Typ: {chat_type})")
-                    print(f"     TELEGRAM_CHAT_ID = \"{chat_id}\"")
+                    print(f'     TELEGRAM_CHAT_ID="{chat_id}"')
                     print()
 
         except Exception as e:

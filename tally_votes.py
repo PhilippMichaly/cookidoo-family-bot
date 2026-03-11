@@ -13,13 +13,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 from config import TELEGRAM_CHAT_ID
 from cookidoo_client import RecipeCandidate, add_to_shopping_list
 from telegram_client import (
+    collect_all_votes_once,
     resolve_number_votes,
     send_result,
     send_no_votes_message,
-    _call_telegram,
 )
 
 logging.basicConfig(
@@ -39,66 +46,6 @@ def load_state() -> tuple[list[RecipeCandidate], str]:
     candidates = [RecipeCandidate(**c) for c in state["candidates"]]
     message_id = state.get("message_id", "")
     return candidates, message_id
-
-
-def collect_all_votes_once() -> dict[str, list[str]]:
-    """
-    Do a single pass through all pending Telegram updates.
-    Returns {recipe_id: [voter_first_name, ...]}.
-    """
-    user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
-
-    try:
-        # Fetch all pending updates with autoPaging to get everything
-        updates = _call_telegram("telegram_bot_api-list-updates", {
-            "limit": 100,
-            "autoPaging": True,
-        })
-        if not isinstance(updates, list):
-            updates = []
-
-        log.info("Found %d updates", len(updates))
-
-        for update in updates:
-            # Handle callback_query (inline button press)
-            cb = update.get("callback_query")
-            if cb:
-                data = cb.get("data", "")
-                if data.startswith("vote:"):
-                    recipe_id = data.split(":", 1)[1]
-                    user = cb.get("from", {})
-                    user_id = str(user.get("id", ""))
-                    first_name = user.get("first_name", "Unbekannt")
-                    if user_id not in user_votes:
-                        user_votes[user_id] = (recipe_id, first_name)
-                        log.info("Vote: %s -> %s", first_name, recipe_id)
-                    else:
-                        log.info("Duplicate vote from %s ignored", first_name)
-
-            # Handle text replies like "3"
-            msg = update.get("message", {})
-            if msg:
-                text = (msg.get("text") or "").strip()
-                if text.isdigit():
-                    user = msg.get("from", {})
-                    user_id = str(user.get("id", ""))
-                    first_name = user.get("first_name", "Unbekannt")
-                    if user_id not in user_votes:
-                        user_votes[user_id] = (f"number:{text}", first_name)
-                        log.info("Text vote: %s -> %s", first_name, text)
-                    else:
-                        log.info("Duplicate text vote from %s ignored", first_name)
-
-    except Exception as e:
-        log.warning("Error fetching updates: %s", e)
-
-    # Aggregate
-    result: dict[str, list[str]] = {}
-    for uid, (recipe_id, name) in user_votes.items():
-        result.setdefault(recipe_id, [])
-        result[recipe_id].append(name)
-
-    return result
 
 
 async def main():
@@ -150,6 +97,15 @@ async def main():
     # Send result
     send_result(TELEGRAM_CHAT_ID, winner, winner_voters, ingredients)
     log.info("Done! Guten Appetit!")
+
+    # Print result as JSON
+    print(json.dumps({
+        "status": "ok",
+        "winner": winner.name,
+        "winner_id": winner.id,
+        "voters": winner_voters,
+        "ingredients": ingredients,
+    }, ensure_ascii=False))
 
     # Clean up
     os.remove(STATE_FILE)
