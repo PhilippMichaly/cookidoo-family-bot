@@ -1,11 +1,20 @@
 """Telegram client – sends votes with inline buttons, collects results.
 
-Uses the Telegram Bot API directly via HTTPS (no external connectors needed).
-Requires TELEGRAM_BOT_TOKEN to be set in the environment.
+Supports two modes:
+1. Direct Telegram Bot API (recommended for self-hosting)
+   → Set TELEGRAM_BOT_TOKEN in your .env file
+2. External tool connector (for managed platforms like Pipedream)
+   → Automatically used if TELEGRAM_BOT_TOKEN is not set but
+     the external-tool CLI is available
+
+For self-hosting, only mode 1 is needed. Mode 2 is a fallback for
+environments with a pre-configured Telegram connector.
 """
 
 import json
 import logging
+import os
+import subprocess
 import time
 
 import requests as http
@@ -15,23 +24,70 @@ from cookidoo_client import RecipeCandidate
 
 log = logging.getLogger(__name__)
 
-# ─── Telegram Bot API base ──────────────────────────────────
+# ─── Transport layer ────────────────────────────────────────
+# Detects which mode to use based on TELEGRAM_BOT_TOKEN availability.
 
-def _api_url(method: str) -> str:
-    """Build Telegram Bot API URL for a given method."""
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+_USE_DIRECT_API = bool(TELEGRAM_BOT_TOKEN)
 
 
-def _call_telegram(method: str, params: dict | None = None) -> dict | list:
-    """Call a Telegram Bot API method via HTTPS POST."""
-    r = http.post(_api_url(method), json=params or {}, timeout=30)
+def _call_telegram_direct(method: str, params: dict | None = None) -> dict | list:
+    """Call Telegram Bot API directly via HTTPS."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    r = http.post(url, json=params or {}, timeout=30)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
     return data.get("result", {})
+
+
+def _call_telegram_external(tool_name: str, arguments: dict) -> dict | list:
+    """Call Telegram via external-tool CLI (Pipedream connector)."""
+    payload = json.dumps({
+        "source_id": "telegram_bot_api__pipedream",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    })
+    result = subprocess.run(
+        ["external-tool", "call", payload],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Telegram API error: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+def _call_telegram(method: str, params: dict | None = None) -> dict | list:
+    """
+    Call Telegram API using the best available transport.
+    - If TELEGRAM_BOT_TOKEN is set → direct HTTPS
+    - Otherwise → external-tool CLI (Pipedream connector)
+    """
+    if _USE_DIRECT_API:
+        return _call_telegram_direct(method, params)
+
+    # Map Bot API method names to Pipedream tool names
+    method_map = {
+        "sendMessage": "telegram_bot_api-send-text-message-or-reply",
+        "getUpdates": "telegram_bot_api-list-updates",
+        "answerCallbackQuery": None,  # Not available in connector
+    }
+
+    tool_name = method_map.get(method)
+    if tool_name is None:
+        log.debug("Method %s not available via external connector, skipping", method)
+        return {}
+
+    # Translate parameter names for the connector
+    args = dict(params or {})
+    if "chat_id" in args:
+        args["chatId"] = str(args.pop("chat_id"))
+    if "reply_markup" in args and isinstance(args["reply_markup"], dict):
+        args["reply_markup"] = json.dumps(args["reply_markup"])
+    if "offset" in args:
+        args["offset"] = str(args["offset"])
+
+    return _call_telegram_external(tool_name, args)
 
 
 # ─── Helpers ────────────────────────────────────────────────
@@ -117,14 +173,16 @@ def send_vote(chat_id: str, candidates: list[RecipeCandidate],
             "callback_data": f"vote:{r.id}",
         }])
 
+    reply_markup = json.dumps({"inline_keyboard": keyboard})
+
     result = _call_telegram("sendMessage", {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "MarkdownV2",
-        "reply_markup": json.dumps({"inline_keyboard": keyboard}),
+        "reply_markup": reply_markup,
     })
 
-    msg_id = str(result.get("message_id", ""))
+    msg_id = _extract_message_id(result)
     log.info("Vote message sent, message_id=%s", msg_id)
     return msg_id
 
@@ -225,52 +283,35 @@ def collect_all_votes_once() -> dict[str, list[str]]:
     Returns {recipe_id: [voter_first_name, ...]}.
     """
     user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
-    last_offset: int | None = None
 
     try:
-        # Fetch all pending updates (multiple pages if needed)
-        while True:
-            params: dict = {"limit": 100, "timeout": 0}
-            if last_offset is not None:
-                params["offset"] = last_offset
+        if _USE_DIRECT_API:
+            # Direct API: paginate with offset
+            last_offset: int | None = None
+            while True:
+                params: dict = {"limit": 100, "timeout": 0}
+                if last_offset is not None:
+                    params["offset"] = last_offset
 
-            updates = _call_telegram("getUpdates", params)
-            if not isinstance(updates, list) or not updates:
-                break
+                updates = _call_telegram("getUpdates", params)
+                if not isinstance(updates, list) or not updates:
+                    break
 
+                for update in updates:
+                    update_id = update.get("update_id")
+                    if update_id is not None:
+                        last_offset = update_id + 1
+                    _process_update(update, user_votes)
+        else:
+            # External connector: use autoPaging
+            updates = _call_telegram_external(
+                "telegram_bot_api-list-updates",
+                {"limit": 100, "autoPaging": True},
+            )
+            if not isinstance(updates, list):
+                updates = []
             for update in updates:
-                update_id = update.get("update_id")
-                if update_id is not None:
-                    last_offset = update_id + 1
-
-                # Handle callback_query (inline button press)
-                cb = update.get("callback_query")
-                if cb:
-                    data = cb.get("data", "")
-                    if data.startswith("vote:"):
-                        recipe_id = data.split(":", 1)[1]
-                        user = cb.get("from", {})
-                        user_id = str(user.get("id", ""))
-                        first_name = user.get("first_name", "Unbekannt")
-                        if user_id not in user_votes:
-                            user_votes[user_id] = (recipe_id, first_name)
-                            log.info("Vote: %s -> %s", first_name, recipe_id)
-                        else:
-                            log.info("Duplicate vote from %s ignored", first_name)
-
-                # Handle text replies like "3"
-                msg = update.get("message", {})
-                if msg:
-                    text = (msg.get("text") or "").strip()
-                    if text.isdigit():
-                        user = msg.get("from", {})
-                        user_id = str(user.get("id", ""))
-                        first_name = user.get("first_name", "Unbekannt")
-                        if user_id not in user_votes:
-                            user_votes[user_id] = (f"number:{text}", first_name)
-                            log.info("Text vote: %s -> %s", first_name, text)
-                        else:
-                            log.info("Duplicate text vote from %s ignored", first_name)
+                _process_update(update, user_votes)
 
     except Exception as e:
         log.warning("Error fetching updates: %s", e)
@@ -282,6 +323,38 @@ def collect_all_votes_once() -> dict[str, list[str]]:
         result[recipe_id].append(name)
 
     return result
+
+
+def _process_update(update: dict, user_votes: dict) -> None:
+    """Process a single Telegram update for votes."""
+    # Handle callback_query (inline button press)
+    cb = update.get("callback_query")
+    if cb:
+        data = cb.get("data", "")
+        if data.startswith("vote:"):
+            recipe_id = data.split(":", 1)[1]
+            user = cb.get("from", {})
+            user_id = str(user.get("id", ""))
+            first_name = user.get("first_name", "Unbekannt")
+            if user_id not in user_votes:
+                user_votes[user_id] = (recipe_id, first_name)
+                log.info("Vote: %s -> %s", first_name, recipe_id)
+            else:
+                log.info("Duplicate vote from %s ignored", first_name)
+
+    # Handle text replies like "3"
+    msg = update.get("message", {})
+    if msg:
+        text = (msg.get("text") or "").strip()
+        if text.isdigit():
+            user = msg.get("from", {})
+            user_id = str(user.get("id", ""))
+            first_name = user.get("first_name", "Unbekannt")
+            if user_id not in user_votes:
+                user_votes[user_id] = (f"number:{text}", first_name)
+                log.info("Text vote: %s -> %s", first_name, text)
+            else:
+                log.info("Duplicate text vote from %s ignored", first_name)
 
 
 def resolve_number_votes(
@@ -377,3 +450,16 @@ def get_updates(offset: int | None = None, limit: int = 100,
         params["offset"] = offset
     result = _call_telegram("getUpdates", params)
     return result if isinstance(result, list) else []
+
+
+def _extract_message_id(result) -> str:
+    """Extract message_id from Telegram API response."""
+    if isinstance(result, dict):
+        if "message_id" in result:
+            return str(result["message_id"])
+        if "result" in result and isinstance(result["result"], dict):
+            return str(result["result"].get("message_id", ""))
+        rv = result.get("$return_value", {})
+        if isinstance(rv, dict):
+            return str(rv.get("message_id", ""))
+    return ""

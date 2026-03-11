@@ -20,7 +20,14 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+from config import TELEGRAM_CHAT_ID
 from telegram_client import get_updates, send_message, _escape_md
 
 logging.basicConfig(
@@ -96,10 +103,6 @@ def check_for_requests() -> list[dict]:
 
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is not set")
-        sys.exit(1)
-
     new_requests = check_for_requests()
     # Output as JSON for further processing
     print(json.dumps({
