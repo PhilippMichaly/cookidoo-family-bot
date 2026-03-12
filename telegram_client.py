@@ -414,7 +414,7 @@ def send_result(chat_id: str, winner: RecipeCandidate, voters: list[str],
         f"\u23F1 Gesamtzeit: {_escape_md(_format_time(winner.total_time))}",
         f"\U0001f37d Portionen: {winner.serving_size}\n",
         "\U0001f4cb *Einkaufsliste:*\n",
-    ]
+    ])
 
     for ing in ingredients:
         lines.append(f"  \u2022 {_escape_md(ing)}")
