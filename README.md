@@ -106,3 +106,222 @@ Alle persistenten Daten liegen in `data/` (bzw. `DATA_DIR`):
 - `recipe_history.json` — Gewinner-Historie (Legacy, jetzt in SQLite)
 
 Im Docker-Setup wird `data/` als benanntes Volume gemountet.
+
+---
+
+## Self-Hosting mit Docker (Schritt-für-Schritt)
+
+Diese Anleitung bringt den Bot auf einem beliebigen Linux-Server (Raspberry Pi, VPS, NAS, Homelab) zum Laufen. Voraussetzung: Docker und Docker Compose sind installiert.
+
+### 1. Telegram-Bot erstellen
+
+```bash
+# In Telegram: @BotFather öffnen und /newbot senden.
+# Einen Namen und Username vergeben.
+# Den Bot-Token kopieren (sieht aus wie 123456789:ABCdef...).
+# Den Bot in die Familiengruppe einladen.
+```
+
+### 2. Chat-ID ermitteln
+
+```bash
+# Nachricht in die Familiengruppe senden, dann:
+curl -s "https://api.telegram.org/bot<DEIN_BOT_TOKEN>/getUpdates" | python3 -m json.tool
+
+# In der Ausgabe nach "chat":{"id": suchen.
+# Gruppen-IDs sind negativ, z.B. -100123456789
+```
+
+### 3. Eigene User-ID ermitteln (für Admin-Rechte)
+
+```bash
+# Dem Bot eine private Nachricht senden, dann:
+curl -s "https://api.telegram.org/bot<DEIN_BOT_TOKEN>/getUpdates" | python3 -m json.tool
+
+# Unter "from":{"id": steht deine User-ID (positiv, z.B. 123456789)
+```
+
+### 4. Repo klonen und konfigurieren
+
+```bash
+git clone https://github.com/PhilippMichaly/cookidoo-family-bot.git
+cd cookidoo-family-bot
+git checkout v2-refactor
+cp .env.example .env
+```
+
+### 5. `.env` ausfüllen
+
+```bash
+nano .env
+```
+
+Minimal-Konfiguration — diese 4 Werte müssen rein:
+
+```env
+COOKIDOO_EMAIL=deine@email.de
+COOKIDOO_PASSWORD=dein-cookidoo-passwort
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+TELEGRAM_CHAT_ID=-100123456789
+```
+
+Empfohlene Zusatzeinstellungen:
+
+```env
+# Deine TG User-ID — nur du kannst /config, /vote, /sync nutzen
+ADMIN_USER_IDS=123456789
+
+# Abstimmung endet jeden Tag um 15:00
+VOTING_END_TIME_LOCAL=15:00
+
+# 5 Rezeptvorschläge statt 7
+NUM_RECIPE_CANDIDATES=5
+```
+
+### 6. Starten
+
+**Variante A: Polling-Modus (einfachster Weg, keine Portfreigabe nötig)**
+
+```bash
+docker compose run --rm bot poll
+```
+
+Oder als Daemon im Hintergrund:
+
+```bash
+# docker-compose.yml anpassen: CMD ["poll"] statt CMD ["serve"]
+docker compose up -d
+```
+
+**Variante B: Webhook-Modus (effizienter, braucht öffentliche URL)**
+
+Wenn dein Server über eine Domain erreichbar ist (z.B. via Reverse Proxy, Cloudflare Tunnel, oder direkte Portfreigabe):
+
+```env
+# In .env ergänzen:
+WEBHOOK_URL=https://deine-domain.de:8443
+WEBHOOK_PORT=8443
+```
+
+```bash
+docker compose up -d
+```
+
+### 7. Prüfen ob es läuft
+
+```bash
+# Logs anschauen
+docker compose logs -f
+
+# Health-Check (nur Webhook-Modus)
+curl http://localhost:8443/health
+# → "ok"
+
+# Im Telegram-Chat:
+/status
+```
+
+### 8. Erster Cache-Sync
+
+Beim allerersten Start synchronisiert der Bot automatisch alle Rezepte aus deinen Cookidoo-Sammlungen. Das kann je nach Anzahl der Rezepte 2–10 Minuten dauern. Du kannst es auch manuell anstoßen:
+
+```
+/sync
+```
+
+### Nützliche Docker-Befehle
+
+```bash
+# Bot stoppen
+docker compose down
+
+# Bot neu starten (z.B. nach .env-Änderung)
+docker compose up -d --force-recreate
+
+# Logs live verfolgen
+docker compose logs -f bot
+
+# In den Container schauen
+docker compose exec bot bash
+
+# Cache-Datenbank inspizieren
+docker compose exec bot sqlite3 /data/recipe_cache.db "SELECT count(*) FROM recipes;"
+
+# Alles zurücksetzen (Cache, Historie, Config)
+docker compose down -v
+docker compose up -d
+```
+
+### Reverse Proxy (optional, für Webhook-Modus)
+
+Falls du Nginx, Caddy oder Traefik nutzt, hier ein Beispiel für **Caddy** (automatisches HTTPS):
+
+```
+# Caddyfile
+cookidoo-bot.deine-domain.de {
+    reverse_proxy localhost:8443
+}
+```
+
+```env
+# .env
+WEBHOOK_URL=https://cookidoo-bot.deine-domain.de
+WEBHOOK_PORT=8443
+```
+
+Für **Nginx**:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name cookidoo-bot.deine-domain.de;
+
+    ssl_certificate     /etc/letsencrypt/live/cookidoo-bot.deine-domain.de/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/cookidoo-bot.deine-domain.de/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### Raspberry Pi / ARM
+
+Das Dockerfile nutzt `python:3.12-slim`, das auch ARM-Images hat. Auf einem Raspberry Pi 4 funktioniert alles out of the box:
+
+```bash
+git clone https://github.com/PhilippMichaly/cookidoo-family-bot.git
+cd cookidoo-family-bot && git checkout v2-refactor
+cp .env.example .env && nano .env
+docker compose up -d
+```
+
+### Auto-Update (optional)
+
+Mit [Watchtower](https://github.com/containrrr/watchtower) kann der Container automatisch aktualisiert werden, wenn du ein neues Image baust:
+
+```yaml
+# In docker-compose.yml ergänzen:
+services:
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 86400 bot
+```
+
+### Troubleshooting
+
+| Problem | Lösung |
+|---------|--------|
+| `No recipes found` | `/sync` ausführen — Cache ist leer |
+| `Telegram API error 401` | Bot-Token prüfen |
+| `Telegram API error 400: chat not found` | Chat-ID prüfen, Bot muss in der Gruppe sein |
+| `Cookidoo login failed` | E-Mail/Passwort prüfen, Cookidoo-Abo aktiv? |
+| `Cache stale` warnung | Normal — Sync läuft automatisch alle 24h |
+| Container startet nicht | `docker compose logs bot` für Details |
+| Webhook bekommt keine Updates | URL erreichbar? `curl https://deine-domain.de:8443/health` |
+| Polling-Modus: doppelte Nachrichten | Webhook vorher entfernen: Bot sendet automatisch `deleteWebhook` |
