@@ -1,0 +1,26 @@
+{
+  "sweet_category_ids": [
+    "VrkNavCategory-RPF-011",
+    "VrkNavCategory-RPF-013"
+  ],
+  "drink_category_ids": [
+    "VrkNavCategory-RPF-015"
+  ],
+  "sweet_keywords": [
+    "kuchen", "torte", "muffin", "cookie", "keks", "plätzchen",
+    "brownie", "tiramisu", "mousse", "pudding", "creme", "crème",
+    "eis ", "sorbet", "panna cotta", "tarte", "praline",
+    "bonbon", "konfekt", "dessert", "nachtisch", "süß",
+    "schokolade", "waffel", "crêpe", "pancake", "pfannkuchen",
+    "marmelade", "konfitüre", "gelee", "sirup",
+    "cupcake", "donut", "macaron", "baiser", "meringue"
+  ],
+  "drink_keywords": [
+    "shake", "cocktail", "smoothie", "lassi", "frapp", "frappé",
+    "milkshake", "eistee", "limonade", "spritz", "mojito",
+    "caipirinha", "daiquiri", "sangria", "bowle"
+  ],
+  "sweet_whitelist": [
+    "kaiserschmarrn", "milchreis"
+  ]
+}

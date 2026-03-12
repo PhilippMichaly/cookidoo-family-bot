@@ -1,531 +1,347 @@
-"""Telegram client – sends votes with inline buttons, collects results.
+"""Telegram client — fully async via aiohttp.
 
-Supports two modes:
-1. Direct Telegram Bot API (recommended for self-hosting)
-   → Set TELEGRAM_BOT_TOKEN in your .env file
-2. External tool connector (for managed platforms like Pipedream)
-   → Automatically used if TELEGRAM_BOT_TOKEN is not set but
-     the external-tool CLI is available
-
-For self-hosting, only mode 1 is needed. Mode 2 is a fallback for
-environments with a pre-configured Telegram connector.
+Features:
+- Vote confirmation via answerCallbackQuery
+- Live vote counter (edits message on each vote)
+- Vote changing (last click counts)
+- No polling in webhook mode
 """
 
 import json
 import logging
-import os
-import subprocess
-import time
+from typing import Any
 
-import requests as http
+import aiohttp
 
-from config import TELEGRAM_BOT_TOKEN
-from cookidoo_client import RecipeCandidate
+import config as cfg
+from cache import Recipe
 
 log = logging.getLogger(__name__)
 
-# ─── Transport layer ────────────────────────────────────────
-# Detects which mode to use based on TELEGRAM_BOT_TOKEN availability.
-
-_USE_DIRECT_API = bool(TELEGRAM_BOT_TOKEN)
+TG_BASE = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}"
 
 
-def _call_telegram_direct(method: str, params: dict | None = None) -> dict | list:
-    """Call Telegram Bot API directly via HTTPS."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = http.post(url, json=params or {}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data.get("result", {})
+# ─── Low-level API ──────────────────────────────────────
+
+async def tg(method: str, params: dict | None = None, **kw) -> Any:
+    """Call Telegram Bot API. Returns result field."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{TG_BASE}/{method}", json=params or {}, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            data = await resp.json()
+            if not data.get("ok"):
+                log.error("TG API error %s: %s", method, data)
+                raise RuntimeError(f"TG error: {data}")
+            return data.get("result", {})
 
 
-def _call_telegram_external(tool_name: str, arguments: dict) -> dict | list:
-    """Call Telegram via external-tool CLI (Pipedream connector)."""
-    payload = json.dumps({
-        "source_id": "telegram_bot_api__pipedream",
-        "tool_name": tool_name,
-        "arguments": arguments,
-    })
-    result = subprocess.run(
-        ["external-tool", "call", payload],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Telegram API error: {result.stderr}")
-    return json.loads(result.stdout)
+# ─── Formatting ─────────────────────────────────────────
+
+def _esc(text: str) -> str:
+    """Escape MarkdownV2 special chars."""
+    out = []
+    for ch in text:
+        if ch in r"_*[]()~`>#+-=|{}.!":
+            out.append(f"\\{ch}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-def _call_telegram(method: str, params: dict | None = None) -> dict | list:
-    """
-    Call Telegram API using the best available transport.
-    - If TELEGRAM_BOT_TOKEN is set → direct HTTPS
-    - Otherwise → external-tool CLI (Pipedream connector)
-    """
-    if _USE_DIRECT_API:
-        return _call_telegram_direct(method, params)
-
-    # Map Bot API method names to Pipedream tool names
-    method_map = {
-        "sendMessage": "telegram_bot_api-send-text-message-or-reply",
-        "getUpdates": "telegram_bot_api-list-updates",
-        "answerCallbackQuery": None,  # Not available in connector
-    }
-
-    tool_name = method_map.get(method)
-    if tool_name is None:
-        log.debug("Method %s not available via external connector, skipping", method)
-        return {}
-
-    # Translate parameter names for the connector
-    args = dict(params or {})
-    if "chat_id" in args:
-        args["chatId"] = str(args.pop("chat_id"))
-    if "reply_markup" in args and isinstance(args["reply_markup"], dict):
-        args["reply_markup"] = json.dumps(args["reply_markup"])
-    if "offset" in args:
-        args["offset"] = str(args["offset"])
-
-    return _call_telegram_external(tool_name, args)
-
-
-# ─── Helpers ────────────────────────────────────────────────
-
-def _format_time(seconds: int) -> str:
-    """Format seconds to a human-readable German time string."""
+def _fmt_time(seconds: int) -> str:
     if seconds <= 0:
         return "k.A."
-    hours = seconds // 3600
-    mins = (seconds % 3600) // 60
-    if hours > 0 and mins > 0:
-        return f"{hours} Std. {mins} Min."
-    if hours > 0:
-        return f"{hours} Std."
-    return f"{mins} Min."
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    if h and m:
+        return f"{h} Std. {m} Min."
+    if h:
+        return f"{h} Std."
+    return f"{m} Min."
 
 
-def _difficulty_emoji(diff: str) -> str:
-    d = diff.lower()
-    if d == "easy":
-        return "\U0001f7e2"   # green circle
-    if d == "medium":
-        return "\U0001f7e1"   # yellow circle
-    return "\U0001f534"       # red circle
+_DIFF_EMOJI = {"easy": "🟢", "medium": "🟡", "difficult": "🔴"}
+_DIFF_DE = {"easy": "einfach", "medium": "mittel", "difficult": "schwer"}
 
 
-def _difficulty_de(diff: str) -> str:
-    d = diff.lower()
-    if d == "easy":
-        return "einfach"
-    if d == "medium":
-        return "mittel"
-    return "schwer"
+# ─── Vote message building ──────────────────────────────
 
-
-def _escape_md(text: str) -> str:
-    """Escape special characters for MarkdownV2."""
-    special = r"_*[]()~`>#+-=|{}.!"
-    result = ""
-    for ch in text:
-        if ch in special:
-            result += f"\\{ch}"
-        else:
-            result += ch
-    return result
-
-
-# ─── Voting ─────────────────────────────────────────────────
-
-def send_vote(chat_id: str, candidates: list[RecipeCandidate],
-              voting_minutes: int) -> str:
-    """
-    Send a voting message with inline keyboard buttons to the Telegram chat.
-    Returns the message_id of the sent message.
-    """
-    # Build message text (MarkdownV2 escaped)
+def _build_vote_text(
+    candidates: list[Recipe],
+    voting_minutes: int,
+    vote_counts: dict[str, int] | None = None,
+    total_votes: int = 0,
+) -> str:
+    """Build the voting message text (MarkdownV2)."""
     lines = [
-        "\U0001f37d *Familienabstimmung: Was kochen wir?*\n",
-        "Stimmt ab, indem ihr auf euren Favoriten tippt\\!\n",
+        "🍽 *Familienabstimmung: Was kochen wir?*\n",
+        "Stimmt ab, indem ihr auf euren Favoriten tippt\\!",
+        "Ihr könnt eure Stimme jederzeit ändern\\.\n",
     ]
 
     for i, r in enumerate(candidates, 1):
-        emoji = _difficulty_emoji(r.difficulty)
-        diff_text = _difficulty_de(r.difficulty)
-        time_text = _escape_md(_format_time(r.total_time))
-        name_esc = _escape_md(r.name)
+        emoji = _DIFF_EMOJI.get(r.difficulty, "🟡")
+        diff = _DIFF_DE.get(r.difficulty, r.difficulty)
+        t = _esc(_fmt_time(r.total_time))
+        name = _esc(r.name)
+        count_str = ""
+        if vote_counts and r.id in vote_counts:
+            c = vote_counts[r.id]
+            count_str = f" — {c} {'Stimme' if c == 1 else 'Stimmen'}"
         lines.append(
-            f"*{i}\\)* {name_esc}\n"
-            f"      \u23F1 {time_text} \\| {emoji} {diff_text} \\| "
-            f"\U0001f37d {r.serving_size} Portionen"
+            f"*{i}\\)* {name}{_esc(count_str)}\n"
+            f"      ⏱ {t} \\| {emoji} {diff} \\| "
+            f"🍽 {r.serving_size} Portionen"
         )
 
-    lines.append(f"\n\u23F0 Abstimmung endet in {voting_minutes} Minuten\\.")
+    footer = f"\n⏰ Abstimmung läuft {voting_minutes} Minuten\\."
+    if total_votes:
+        footer += f"\n📊 Bisher {total_votes} {'Stimme' if total_votes == 1 else 'Stimmen'} abgegeben\\."
+    lines.append(footer)
 
-    text = "\n".join(lines)
+    return "\n".join(lines)
 
-    # Build inline keyboard – one button per recipe
-    keyboard = []
+
+def _build_keyboard(candidates: list[Recipe]) -> str:
+    """Build inline keyboard JSON."""
+    kb = []
     for i, r in enumerate(candidates, 1):
-        short_name = r.name[:28] + ("..." if len(r.name) > 28 else "")
-        keyboard.append([{
-            "text": f"{i}. {short_name}",
-            "callback_data": f"vote:{r.id}",
-        }])
+        short = r.name[:28] + ("…" if len(r.name) > 28 else "")
+        kb.append([{"text": f"{i}. {short}", "callback_data": f"vote:{r.id}"}])
+    return json.dumps({"inline_keyboard": kb})
 
-    reply_markup = json.dumps({"inline_keyboard": keyboard})
 
-    result = _call_telegram("sendMessage", {
+# ─── Public API ──────────────────────────────────────────
+
+async def send_vote(
+    chat_id: str,
+    candidates: list[Recipe],
+    voting_minutes: int,
+) -> str:
+    """Send voting message with inline buttons. Returns message_id."""
+    text = _build_vote_text(candidates, voting_minutes)
+    kb = _build_keyboard(candidates)
+
+    # Try sending with photo of first candidate
+    first_image = candidates[0].image_url if candidates else ""
+    msg_id = ""
+
+    if first_image:
+        try:
+            result = await tg("sendPhoto", {
+                "chat_id": chat_id,
+                "photo": first_image,
+                "caption": text,
+                "parse_mode": "MarkdownV2",
+                "reply_markup": kb,
+            })
+            msg_id = str(result.get("message_id", ""))
+            log.info("Vote sent with photo, msg_id=%s", msg_id)
+            return msg_id
+        except Exception as e:
+            log.warning("Photo send failed, falling back to text: %s", e)
+
+    result = await tg("sendMessage", {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "MarkdownV2",
-        "reply_markup": reply_markup,
+        "reply_markup": kb,
     })
-
-    msg_id = _extract_message_id(result)
-    log.info("Vote message sent, message_id=%s", msg_id)
+    msg_id = str(result.get("message_id", ""))
+    log.info("Vote sent (text only), msg_id=%s", msg_id)
     return msg_id
 
 
-def collect_votes(voting_minutes: int) -> dict[str, list[str]]:
-    """
-    Poll Telegram for callback_query updates over the voting period.
+async def update_vote_message(
+    chat_id: str,
+    message_id: str,
+    candidates: list[Recipe],
+    voting_minutes: int,
+    vote_counts: dict[str, int],
+    total_votes: int,
+    has_photo: bool = False,
+) -> None:
+    """Edit the vote message to show live vote counts."""
+    text = _build_vote_text(candidates, voting_minutes, vote_counts, total_votes)
+    kb = _build_keyboard(candidates)
 
-    Uses offset-based pagination so we don't re-process old updates.
-    Each user gets exactly one vote – the first click counts,
-    subsequent clicks are ignored.
+    try:
+        method = "editMessageCaption" if has_photo else "editMessageText"
+        params = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "parse_mode": "MarkdownV2",
+            "reply_markup": kb,
+        }
+        if has_photo:
+            params["caption"] = text
+        else:
+            params["text"] = text
+        await tg(method, params)
+    except Exception as e:
+        # "message is not modified" is expected if counts didn't change
+        if "not modified" not in str(e).lower():
+            log.warning("Could not update vote message: %s", e)
 
-    Returns {recipe_id: [voter_first_name, ...]}.
+
+async def answer_callback(callback_id: str, text: str) -> None:
+    """Send toast notification to voter."""
+    try:
+        await tg("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": text,
+            "show_alert": False,
+        })
+    except Exception as e:
+        log.debug("answerCallbackQuery failed: %s", e)
+
+
+async def send_result(
+    chat_id: str,
+    winner: Recipe,
+    voters: list[str],
+    ingredients: list[str],
+    *,
+    is_tie: bool = False,
+    tied_names: list[str] | None = None,
+) -> None:
+    """Send voting result + shopping list."""
+    voter_text = ", ".join(voters) if voters else "niemand"
+
+    lines = [
+        "🏆 *Ergebnis der Abstimmung*\n",
+        f"🍽 *{_esc(winner.name)}* hat gewonnen\\!",
+    ]
+    if is_tie and tied_names:
+        lines.append(f"🎲 Gleichstand mit {_esc(', '.join(tied_names))} – das Los hat entschieden\\!")
+
+    lines.extend([
+        f"Gewählt von: {_esc(voter_text)}\n",
+        f"⏱ Gesamtzeit: {_esc(_fmt_time(winner.total_time))}",
+        f"🍽 Portionen: {winner.serving_size}\n",
+    ])
+
+    if ingredients:
+        lines.append("📋 *Einkaufsliste:*\n")
+        for ing in ingredients:
+            lines.append(f"  • {_esc(ing)}")
+
+    lines.append(f"\n🔗 [Rezept auf Cookidoo]({_esc(winner.url)})")
+    lines.append("\n✅ Die Einkaufsliste wurde auch in Cookidoo gespeichert\\.")
+
+    await tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": "\n".join(lines),
+        "parse_mode": "MarkdownV2",
+    })
+
+
+async def send_text(chat_id: str, text: str, **kw) -> dict:
+    """Send plain text message."""
+    return await tg("sendMessage", {"chat_id": chat_id, "text": text, **kw})
+
+
+async def send_md(chat_id: str, text: str) -> dict:
+    """Send MarkdownV2 message."""
+    return await tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": _esc(text),
+        "parse_mode": "MarkdownV2",
+    })
+
+
+# ─── Polling mode (fallback) ────────────────────────────
+
+async def poll_votes(
+    chat_id: str,
+    message_id: str,
+    candidates: list[Recipe],
+    voting_minutes: int,
+    has_photo: bool = False,
+) -> dict[str, list[str]]:
+    """Poll-based vote collection with live updates.
+
+    Returns {recipe_id: [voter_name, ...]}.
     """
-    # Track votes as {user_id: (recipe_id, first_name)}
-    user_votes: dict[str, tuple[str, str]] = {}
+    import asyncio
+    import time
+
+    user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
     end_time = time.time() + voting_minutes * 60
-    poll_interval = 10  # seconds
-    last_offset: int | None = None
-
-    log.info("Collecting votes for %d minutes ...", voting_minutes)
+    offset: int | None = None
+    last_counts: dict[str, int] = {}
 
     while time.time() < end_time:
         try:
             params: dict = {"limit": 100, "timeout": 5}
-            if last_offset is not None:
-                params["offset"] = last_offset
+            if offset is not None:
+                params["offset"] = offset
 
-            updates = _call_telegram("getUpdates", params)
+            updates = await tg("getUpdates", params)
             if not isinstance(updates, list):
                 updates = []
 
-            for update in updates:
-                update_id = update.get("update_id")
-                if update_id is not None:
-                    # Advance offset past this update
-                    last_offset = update_id + 1
+            changed = False
+            for upd in updates:
+                uid = upd.get("update_id")
+                if uid is not None:
+                    offset = uid + 1
 
-                # Handle callback_query (inline button press)
-                cb = update.get("callback_query")
-                if cb:
-                    data = cb.get("data", "")
-                    if data.startswith("vote:"):
-                        recipe_id = data.split(":", 1)[1]
-                        user = cb.get("from", {})
-                        user_id = str(user.get("id", ""))
-                        first_name = user.get("first_name", "Unbekannt")
+                cb = upd.get("callback_query")
+                if not cb:
+                    continue
 
-                        if user_id in user_votes:
-                            log.info(
-                                "%s tried to vote again – ignored (already voted for %s)",
-                                first_name, user_votes[user_id][0],
-                            )
-                        else:
-                            user_votes[user_id] = (recipe_id, first_name)
-                            log.info("Vote from %s for %s", first_name, recipe_id)
+                data = cb.get("data", "")
+                if not data.startswith("vote:"):
+                    continue
 
-                        # Answer callback to remove loading indicator
-                        try:
-                            _call_telegram("answerCallbackQuery", {
-                                "callback_query_id": cb.get("id"),
-                            })
-                        except Exception:
-                            pass
+                recipe_id = data.split(":", 1)[1]
+                user = cb.get("from", {})
+                user_id = str(user.get("id", ""))
+                first_name = user.get("first_name", "Unbekannt")
+                cb_id = cb.get("id", "")
 
-                # Also handle text replies like "3" as fallback
-                msg = update.get("message", {})
-                if msg:
-                    text = (msg.get("text") or "").strip()
-                    if text.isdigit():
-                        user = msg.get("from", {})
-                        user_id = str(user.get("id", ""))
-                        first_name = user.get("first_name", "Unbekannt")
-                        if user_id in user_votes:
-                            log.info("%s tried text vote – ignored", first_name)
-                        else:
-                            user_votes[user_id] = (f"number:{text}", first_name)
-                            log.info("Text vote from %s: %s", first_name, text)
+                # Allow vote change
+                old = user_votes.get(user_id)
+                user_votes[user_id] = (recipe_id, first_name)
+                changed = True
+
+                recipe_name = next(
+                    (c.name for c in candidates if c.id == recipe_id),
+                    recipe_id,
+                )
+
+                if old and old[0] != recipe_id:
+                    await answer_callback(cb_id, f"↩️ Stimme geändert zu '{recipe_name}'")
+                    log.info("Vote changed: %s -> %s", first_name, recipe_name)
+                elif old and old[0] == recipe_id:
+                    await answer_callback(cb_id, f"✓ Du hast bereits für '{recipe_name}' gestimmt")
+                    changed = False
+                else:
+                    await answer_callback(cb_id, f"✓ Stimme für '{recipe_name}' registriert!")
+                    log.info("Vote: %s -> %s", first_name, recipe_name)
+
+            # Update message with live counts if changed
+            if changed:
+                counts: dict[str, int] = {}
+                for rid, _ in user_votes.values():
+                    counts[rid] = counts.get(rid, 0) + 1
+
+                if counts != last_counts:
+                    await update_vote_message(
+                        chat_id, message_id, candidates,
+                        voting_minutes, counts, len(user_votes), has_photo,
+                    )
+                    last_counts = counts.copy()
 
         except Exception as e:
-            log.warning("Error polling updates: %s", e)
+            log.warning("Poll error: %s", e)
 
-        time.sleep(poll_interval)
+        await asyncio.sleep(3)
 
-    # Aggregate: {recipe_id: [first_name, ...]}
+    # Aggregate results
     result: dict[str, list[str]] = {}
-    for user_id, (recipe_id, name) in user_votes.items():
-        result.setdefault(recipe_id, [])
-        result[recipe_id].append(name)
-
+    for _, (recipe_id, name) in user_votes.items():
+        result.setdefault(recipe_id, []).append(name)
     return result
-
-
-def collect_all_votes_once(
-    min_update_id: int | None = None,
-) -> dict[str, list[str]]:
-    """
-    Do a single pass through all pending Telegram updates.
-    Used by Phase 2 (tally) to collect votes after the voting window.
-
-    If min_update_id is given, updates with update_id <= min_update_id
-    are ignored (they predate the current vote).
-
-    Returns {recipe_id: [voter_first_name, ...]}.
-    """
-    user_votes: dict[str, tuple[str, str]] = {}  # user_id -> (recipe_id, name)
-
-    try:
-        if _USE_DIRECT_API:
-            # Direct API: paginate with offset
-            last_offset: int | None = None
-            while True:
-                params: dict = {"limit": 100, "timeout": 0}
-                if last_offset is not None:
-                    params["offset"] = last_offset
-
-                updates = _call_telegram("getUpdates", params)
-                if not isinstance(updates, list) or not updates:
-                    break
-
-                for update in updates:
-                    update_id = update.get("update_id")
-                    if update_id is not None:
-                        last_offset = update_id + 1
-                    if min_update_id is not None and update_id is not None:
-                        if update_id <= min_update_id:
-                            continue
-                    _process_update(update, user_votes)
-        else:
-            # External connector: use autoPaging
-            updates = _call_telegram_external(
-                "telegram_bot_api-list-updates",
-                {"limit": 100, "autoPaging": True},
-            )
-            if not isinstance(updates, list):
-                updates = []
-            for update in updates:
-                update_id = update.get("update_id")
-                if min_update_id is not None and update_id is not None:
-                    if update_id <= min_update_id:
-                        continue
-                _process_update(update, user_votes)
-
-    except Exception as e:
-        log.warning("Error fetching updates: %s", e)
-
-    # Aggregate
-    result: dict[str, list[str]] = {}
-    for uid, (recipe_id, name) in user_votes.items():
-        result.setdefault(recipe_id, [])
-        result[recipe_id].append(name)
-
-    return result
-
-
-def _process_update(update: dict, user_votes: dict) -> None:
-    """Process a single Telegram update for votes."""
-    # Handle callback_query (inline button press)
-    cb = update.get("callback_query")
-    if cb:
-        data = cb.get("data", "")
-        if data.startswith("vote:"):
-            recipe_id = data.split(":", 1)[1]
-            user = cb.get("from", {})
-            user_id = str(user.get("id", ""))
-            first_name = user.get("first_name", "Unbekannt")
-            if user_id not in user_votes:
-                user_votes[user_id] = (recipe_id, first_name)
-                log.info("Vote: %s -> %s", first_name, recipe_id)
-            else:
-                log.info("Duplicate vote from %s ignored", first_name)
-
-    # Handle text replies like "3"
-    msg = update.get("message", {})
-    if msg:
-        text = (msg.get("text") or "").strip()
-        if text.isdigit():
-            user = msg.get("from", {})
-            user_id = str(user.get("id", ""))
-            first_name = user.get("first_name", "Unbekannt")
-            if user_id not in user_votes:
-                user_votes[user_id] = (f"number:{text}", first_name)
-                log.info("Text vote: %s -> %s", first_name, text)
-            else:
-                log.info("Duplicate text vote from %s ignored", first_name)
-
-
-def resolve_number_votes(
-    votes: dict[str, list[str]],
-    candidates: list[RecipeCandidate],
-) -> dict[str, list[str]]:
-    """Convert 'number:N' vote keys to actual recipe IDs."""
-    resolved: dict[str, list[str]] = {}
-    for key, names in votes.items():
-        if key.startswith("number:"):
-            idx = int(key.split(":")[1]) - 1
-            if 0 <= idx < len(candidates):
-                real_id = candidates[idx].id
-                resolved.setdefault(real_id, [])
-                resolved[real_id].extend(names)
-            else:
-                log.warning("Invalid vote number: %s", key)
-        else:
-            resolved.setdefault(key, [])
-            resolved[key].extend(names)
-    return resolved
-
-
-# ─── Result messages ────────────────────────────────────────
-
-def send_result(chat_id: str, winner: RecipeCandidate, voters: list[str],
-                ingredients: list[str], *,
-                is_tie: bool = False,
-                tied_names: list[str] | None = None) -> None:
-    """Send the voting result and shopping list to the chat."""
-    voter_text = ", ".join(voters) if voters else "niemand"
-
-    lines = [
-        "\U0001f3c6 *Ergebnis der Abstimmung*\n",
-        f"\U0001f37d *{_escape_md(winner.name)}* hat gewonnen\\!",
-    ]
-
-    if is_tie and tied_names:
-        names_text = _escape_md(", ".join(tied_names))
-        lines.append(f"\U0001f3b2 Gleichstand mit {names_text} \u2013 das Los hat entschieden\\!")
-
-    lines.extend([
-        f"Gew\u00e4hlt von: {_escape_md(voter_text)}\n",
-        f"\u23F1 Gesamtzeit: {_escape_md(_format_time(winner.total_time))}",
-        f"\U0001f37d Portionen: {winner.serving_size}\n",
-        "\U0001f4cb *Einkaufsliste:*\n",
-    ])
-
-    for ing in ingredients:
-        lines.append(f"  \u2022 {_escape_md(ing)}")
-
-    lines.append(f"\n\U0001f517 [Rezept auf Cookidoo]({_escape_md(winner.url)})")
-    lines.append(
-        "\n\u2705 Die Einkaufsliste wurde auch in Cookidoo gespeichert\\."
-    )
-
-    text = "\n".join(lines)
-
-    _call_telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "MarkdownV2",
-    })
-    log.info("Result message sent for %s", winner.name)
-
-
-def send_no_votes_message(chat_id: str) -> None:
-    """Send a message when nobody voted."""
-    _call_telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": (
-            "\U0001f615 Leider hat niemand abgestimmt\\. "
-            "N\u00e4chstes Mal vielleicht\\!"
-        ),
-        "parse_mode": "MarkdownV2",
-    })
-
-
-def send_error_message(chat_id: str, error: str) -> None:
-    """Send an error message to the chat."""
-    _call_telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": f"\u26A0\uFE0F Fehler beim Rezept\\-Bot: {_escape_md(error)}",
-        "parse_mode": "MarkdownV2",
-    })
-
-
-def send_message(chat_id: str, text: str, **kwargs) -> dict:
-    """Send a plain text message (convenience wrapper)."""
-    return _call_telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        **kwargs,
-    })
-
-
-def get_updates(offset: int | None = None, limit: int = 100,
-                timeout: int = 0) -> list:
-    """Get pending updates from the Telegram Bot API."""
-    params = {"limit": limit, "timeout": timeout}
-    if offset is not None:
-        params["offset"] = offset
-    result = _call_telegram("getUpdates", params)
-    return result if isinstance(result, list) else []
-
-
-def reset_updates_offset(chat_id: str | None = None) -> None:
-    """Best-effort reset of the update offset.
-
-    Telegram doesn't provide a true 'reset' API. The practical meaning here is:
-    consume nothing and allow the next caller to re-read older pending updates.
-
-    We implement this by *not* advancing offset state on our side. For the
-    direct Bot API, each polling loop already starts without a stored offset.
-
-    This function exists so feature requests can be implemented explicitly and
-    logged/audited.
-    """
-    # No persistent offset is stored; so a reset is a no-op.
-    # Keeping the function to support the feature request intent.
-    log.info("Reset update offset requested (no persistent offset to reset)")
-
-
-def get_last_feature_request(chat_id: str, limit: int = 50) -> str:
-    """Return the most recent plain-text message that looks like a feature request.
-
-    This is used to implement small runtime overrides (e.g., end time) without
-    changing the scheduler/config.
-
-    We scan a limited number of updates and pick the newest message text.
-    """
-    try:
-        updates = get_updates(offset=None, limit=limit, timeout=0)
-    except Exception as e:
-        log.info("Could not read updates for feature request: %s", e)
-        return ""
-
-    last_text = ""
-    last_update_id = -1
-    for upd in updates or []:
-        uid = upd.get("update_id", -1)
-        msg = upd.get("message") or {}
-        text = (msg.get("text") or "").strip()
-        if text and uid >= last_update_id:
-            last_text = text
-            last_update_id = uid
-
-    return last_text
-
-
-def _extract_message_id(result) -> str:
-    """Extract message_id from Telegram API response."""
-    if isinstance(result, dict):
-        if "message_id" in result:
-            return str(result["message_id"])
-        if "result" in result and isinstance(result["result"], dict):
-            return str(result["result"].get("message_id", ""))
-        rv = result.get("$return_value", {})
-        if isinstance(rv, dict):
-            return str(rv.get("message_id", ""))
-    return ""

@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${WEBHOOK_PORT:-8443}:8443"
+    volumes:
+      - bot-data:/data
+    environment:
+      - DATA_DIR=/data
+
+volumes:
+  bot-data:
