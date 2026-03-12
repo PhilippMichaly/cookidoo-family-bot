@@ -30,7 +30,6 @@ except ImportError:
 
 from config import (
     COOKIDOO_EMAIL,
-    TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     NUM_RECIPE_CANDIDATES,
     VOTING_DURATION_MINUTES,
@@ -57,13 +56,18 @@ def validate_config():
     missing = []
     if not COOKIDOO_EMAIL:
         missing.append("COOKIDOO_EMAIL")
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         log.error("Missing environment variables: %s", ", ".join(missing))
         log.error("Copy .env.example to .env and fill in your values.")
+        sys.exit(1)
+
+    # Telegram needs either a bot token (direct API) or the external-tool CLI
+    from telegram_client import _USE_DIRECT_API
+    import shutil
+    if not _USE_DIRECT_API and not shutil.which("external-tool"):
+        log.error("No Telegram transport available. Set TELEGRAM_BOT_TOKEN or install external-tool CLI.")
         sys.exit(1)
 
 
