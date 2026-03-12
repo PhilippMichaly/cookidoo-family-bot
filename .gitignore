@@ -4,5 +4,6 @@ __pycache__/
 vote_state.json
 last_candidates.json
 recipe_history.json
+feature_listener_offset.json
 *.egg-info/
 .venv/

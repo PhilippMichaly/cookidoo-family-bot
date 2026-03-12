@@ -38,15 +38,45 @@ log = logging.getLogger("feature_listener")
 
 TRIGGER_COMMANDS = ("/wunsch", "/feature", "/idee")
 
+# Persistent offset file so we don't re-process old messages
+_OFFSET_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "feature_listener_offset.json"
+)
+
+
+def _load_offset() -> int | None:
+    """Load the last processed update_id from disk."""
+    try:
+        with open(_OFFSET_FILE) as f:
+            data = json.load(f)
+        return data.get("next_offset")
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def _save_offset(next_offset: int) -> None:
+    """Persist the next offset so future runs skip already-seen updates."""
+    with open(_OFFSET_FILE, "w") as f:
+        json.dump({"next_offset": next_offset}, f)
+    log.info("Saved feature listener offset: %d", next_offset)
+
 
 def check_for_requests() -> list[dict]:
     """Check Telegram for feature request commands. Returns new requests."""
     new_requests = []
+    offset = _load_offset()
+    max_update_id: int | None = None
 
     try:
-        updates = get_updates(limit=100)
+        updates = get_updates(offset=offset, limit=100)
 
         for update in updates:
+            # Track highest update_id for offset persistence
+            update_id = update.get("update_id")
+            if update_id is not None:
+                if max_update_id is None or update_id > max_update_id:
+                    max_update_id = update_id
+
             msg = update.get("message", {})
             if not msg:
                 continue
@@ -98,6 +128,10 @@ def check_for_requests() -> list[dict]:
 
     except Exception as e:
         log.error("Error checking updates: %s", e)
+
+    # Persist offset so next run skips everything we've already seen
+    if max_update_id is not None:
+        _save_offset(max_update_id + 1)
 
     return new_requests
 
