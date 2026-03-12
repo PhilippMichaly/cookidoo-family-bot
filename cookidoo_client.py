@@ -30,10 +30,16 @@ log = logging.getLogger(__name__)
 # Difficulty levels ranked for filtering
 DIFFICULTY_RANK = {"easy": 1, "medium": 2, "difficult": 3}
 
-# Categories that count as sweets/desserts (will be filtered out)
+# Categories that count as sweets/desserts or drinks (will be filtered out)
 SWEET_CATEGORY_IDS = {
     "VrkNavCategory-RPF-011",  # Desserts und Süßigkeiten
     "VrkNavCategory-RPF-013",  # Backen, süß
+}
+
+# Drink-related categories (shakes/cocktails/smoothies etc.) to exclude.
+# IDs can differ by locale/account; we also use name keywords as fallback.
+DRINK_CATEGORY_IDS = {
+    "VrkNavCategory-RPF-015",  # Getränke (often)
 }
 
 # Sweet keywords in recipe names (fallback if category is missing)
@@ -45,6 +51,25 @@ SWEET_NAME_KEYWORDS = [
     "schokolade", "waffel", "crêpe", "pancake", "pfannkuchen",
     "marmelade", "konfitüre", "gelee", "sirup",
     "cupcake", "donut", "macaron", "baiser", "meringue",
+]
+
+# Drink keywords in recipe names (fallback if category is missing)
+DRINK_NAME_KEYWORDS = [
+    "shake",
+    "cocktail",
+    "smoothie",
+    "lassi",
+    "frapp",
+    "frappé",
+    "milkshake",
+    "eistee",
+    "limonade",
+    "spritz",
+    "mojito",
+    "caipirinha",
+    "daiquiri",
+    "sangria",
+    "bowle",
 ]
 
 # Exceptions: these sweet dishes ARE allowed
@@ -76,6 +101,20 @@ def _is_sweet(name: str, details) -> bool:
     # Fallback: keyword check in recipe name
     name_lower = name.lower()
     for keyword in SWEET_NAME_KEYWORDS:
+        if keyword in name_lower:
+            return True
+
+    return False
+
+
+def _is_drink(name: str, details) -> bool:
+    """Check if a recipe is a drink (shake/cocktail etc.) based on category or name."""
+    for cat in details.categories:
+        if cat.id in DRINK_CATEGORY_IDS:
+            return True
+
+    name_lower = name.lower()
+    for keyword in DRINK_NAME_KEYWORDS:
         if keyword in name_lower:
             return True
 
@@ -224,6 +263,11 @@ async def fetch_candidates(num: int = 7) -> list[RecipeCandidate]:
                 # Filter out sweets/desserts (unless whitelisted)
                 if _is_sweet(rname, details) and not _is_whitelisted(rname):
                     log.debug("Skipping sweet: %s", rname)
+                    continue
+
+                # Filter out drinks (shakes/cocktails etc.)
+                if _is_drink(rname, details):
+                    log.debug("Skipping drink: %s", rname)
                     continue
 
                 # Ingredients are loaded lazily – only for the winner in

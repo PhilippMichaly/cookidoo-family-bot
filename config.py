@@ -17,7 +17,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ─── Voting ─────────────────────────────────────────────────
 NUM_RECIPE_CANDIDATES = int(os.environ.get("NUM_RECIPE_CANDIDATES", "7"))
+# Default voting duration. If VOTING_END_TIME_LOCAL is set, it takes precedence.
 VOTING_DURATION_MINUTES = int(os.environ.get("VOTING_DURATION_MINUTES", "120"))
+
+# Optional: set a fixed local end time (HH:MM) for the vote, e.g. "17:00".
+# If set, the bot will compute duration "until that time" (same day, or next day if already past).
+VOTING_END_TIME_LOCAL = os.environ.get("VOTING_END_TIME_LOCAL", "")
 
 # Allow users to request a different voting end time (local time) via Telegram,
 # e.g. "Liste bis 17:00 laufen lassen".

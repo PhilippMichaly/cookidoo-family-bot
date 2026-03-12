@@ -25,6 +25,7 @@ from config import (
     NUM_RECIPE_CANDIDATES,
     VOTING_DURATION_MINUTES,
     VOTING_DURATION_MAX_MINUTES,
+    VOTING_END_TIME_LOCAL,
 )
 from cookidoo_client import fetch_candidates
 from telegram_client import send_vote, send_error_message, get_updates
@@ -72,8 +73,21 @@ async def main():
 
     # Determine voting duration:
     # - default from env
+    # - optional fixed local end time via env (VOTING_END_TIME_LOCAL)
     # - optionally overridden by a Telegram feature request like "bis 17:00"
     voting_minutes = VOTING_DURATION_MINUTES
+
+    # Fixed end time from env takes precedence over the default duration.
+    if VOTING_END_TIME_LOCAL:
+        try:
+            from feature_requests import compute_voting_minutes_until
+            requested = compute_voting_minutes_until(VOTING_END_TIME_LOCAL)
+            if 1 <= requested <= VOTING_DURATION_MAX_MINUTES:
+                voting_minutes = requested
+                log.info("Voting duration set by VOTING_END_TIME_LOCAL='%s' -> %d minutes",
+                         VOTING_END_TIME_LOCAL, voting_minutes)
+        except Exception as e:
+            log.warning("Invalid VOTING_END_TIME_LOCAL='%s': %s", VOTING_END_TIME_LOCAL, e)
 
     try:
         # Keep this optional and robust; if anything fails we fall back
